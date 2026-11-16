@@ -1757,6 +1757,10 @@ impl Egl {
     /// a context drawing in a fullscreen Wayland window managed by SDL2.
     pub(super) fn new_wayland() -> Result<(Egl, glow::Context, WaylandWindow), String> {
         const SDL_INIT_VIDEO: u32 = 0x0000_0020;
+        const SDL_GL_RED_SIZE: i32 = 0;
+        const SDL_GL_GREEN_SIZE: i32 = 1;
+        const SDL_GL_BLUE_SIZE: i32 = 2;
+        const SDL_GL_ALPHA_SIZE: i32 = 3;
         const SDL_GL_CONTEXT_MAJOR_VERSION: i32 = 17;
         const SDL_GL_CONTEXT_MINOR_VERSION: i32 = 18;
         const SDL_GL_CONTEXT_EGL: i32 = 19;
@@ -1765,8 +1769,19 @@ impl Egl {
         const SDL_WINDOW_OPENGL_FULLSCREEN: u32 = 0x0000_1003;
         const SDL_WINDOWPOS_UNDEFINED: i32 = 0x1FFF_0000;
 
+        #[repr(C)]
+        struct SdlDisplayMode {
+            format: u32,
+            w: i32,
+            h: i32,
+            refresh_rate: i32,
+            driverdata: *mut c_void,
+        }
+
+        type SdlSetHint = unsafe extern "C" fn(*const c_char, *const c_char) -> i32;
         type SdlInit = unsafe extern "C" fn(u32) -> i32;
         type SdlSetAttribute = unsafe extern "C" fn(i32, i32) -> i32;
+        type SdlGetWindowDisplayMode = unsafe extern "C" fn(*mut c_void, *mut SdlDisplayMode) -> i32;
         type SdlCreateWindow = unsafe extern "C" fn(*const c_char, i32, i32, i32, i32, u32) -> *mut c_void;
         type SdlCreateContext = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
         type SdlGetVideoDriver = unsafe extern "C" fn() -> *const c_char;
@@ -1788,6 +1803,10 @@ impl Egl {
 
         unsafe {
             let sdl = open(&["libSDL2-2.0.so.0", "libSDL2.so"]).map_err(|why| format!("could not load SDL2, {why}"))?;
+            let set_hint: Option<SdlSetHint> = {
+                let address = symbol(&sdl, "SDL_SetHint");
+                (!address.is_null()).then(|| std::mem::transmute::<*const c_void, SdlSetHint>(address))
+            };
             let init: SdlInit = sdl_function!(&sdl, "SDL_InitSubSystem", SdlInit);
             let set_attribute: SdlSetAttribute = sdl_function!(&sdl, "SDL_GL_SetAttribute", SdlSetAttribute);
             let create_window: SdlCreateWindow = sdl_function!(&sdl, "SDL_CreateWindow", SdlCreateWindow);
@@ -1796,9 +1815,16 @@ impl Egl {
             let get_video_driver: SdlGetVideoDriver = sdl_function!(&sdl, "SDL_GetCurrentVideoDriver", SdlGetVideoDriver);
             let pump_events: SdlPumpEvents = sdl_function!(&sdl, "SDL_PumpEvents", SdlPumpEvents);
             let get_window_size: SdlGetWindowSize = sdl_function!(&sdl, "SDL_GetWindowSize", SdlGetWindowSize);
+            let get_display_mode: Option<SdlGetWindowDisplayMode> = {
+                let address = symbol(&sdl, "SDL_GetWindowDisplayMode");
+                (!address.is_null()).then(|| std::mem::transmute::<*const c_void, SdlGetWindowDisplayMode>(address))
+            };
             let delete_context: SdlDeleteContext = sdl_function!(&sdl, "SDL_GL_DeleteContext", SdlDeleteContext);
             let destroy_window: SdlDestroyWindow = sdl_function!(&sdl, "SDL_DestroyWindow", SdlDestroyWindow);
             let quit_subsystem: SdlQuit = sdl_function!(&sdl, "SDL_QuitSubSystem", SdlQuit);
+            if let Some(set_hint) = set_hint {
+                set_hint(c"SDL_VIDEO_WAYLAND_ALLOW_LIBDECOR".as_ptr(), c"0".as_ptr());
+            }
             if init(SDL_INIT_VIDEO) != 0 {
                 return Err(sdl_failure(get_error, "SDL2 video initialization failed"));
             }
@@ -1820,6 +1846,10 @@ impl Egl {
                 return Err(format!("SDL2 selected the {driver} video driver, not Wayland"));
             }
             for (attribute, value) in [
+                (SDL_GL_RED_SIZE, 8),
+                (SDL_GL_GREEN_SIZE, 8),
+                (SDL_GL_BLUE_SIZE, 8),
+                (SDL_GL_ALPHA_SIZE, 0),
                 (SDL_GL_CONTEXT_MAJOR_VERSION, 3),
                 (SDL_GL_CONTEXT_MINOR_VERSION, 1),
                 (SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES),
@@ -1842,6 +1872,13 @@ impl Egl {
             if width > 0 && height > 0 {
                 window.size = (width, height);
                 window.layout_size = (width, height);
+            }
+            if let Some(get_display_mode) = get_display_mode {
+                let mut mode = SdlDisplayMode { format: 0, w: 0, h: 0, refresh_rate: 0, driverdata: std::ptr::null_mut() };
+                if get_display_mode(window.window, &mut mode) == 0 && (50..=70).contains(&mode.refresh_rate) {
+                    log::info!("Wayland display {}x{} at {} Hz", mode.w, mode.h, mode.refresh_rate);
+                    PANEL_PERIOD.store((1e9 / mode.refresh_rate as f64) as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
 
             let library = open(&["libEGL.so.1", "libEGL.so"]).map_err(|why| format!("could not load libEGL, {why}"))?;
